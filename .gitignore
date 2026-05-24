@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.spec.bak
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# PyInstaller
+*.manifest
+*.spec.bak
+
+# Debug / logs
+*.log
+debug_*.log
+
+# Database (user data)
+*.db
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Secrets / keys
+.env
+.env.*
+credentials*
+
+# Claude Code
+.claude/
+
+# Misc
+*.png
+make_ico.py
