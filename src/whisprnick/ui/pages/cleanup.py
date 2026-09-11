@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit,
-    QScrollArea, QFrame, QSizePolicy,
+    QScrollArea, QFrame, QSizePolicy, QPushButton,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QThread, QTimer
 
 from whisprnick.ui.widgets.card import Card
 from whisprnick.ui.widgets.btn import Btn
@@ -14,6 +14,7 @@ from whisprnick.ui.widgets.field_label import FieldLabel
 from whisprnick.ui.widgets.section_title import SectionTitle
 from whisprnick.ui.styles.theme import Colors, Fonts
 from whisprnick.core.cleanup import CleanupEngine, DEFAULT_TEMPLATE
+from whisprnick.core.textutil import light_clean
 
 
 _BEHAVIORS = [
@@ -25,6 +26,17 @@ _BEHAVIORS = [
     ("formal", "Bump formality", "for emails to people who matter", False),
     ("bullets", "Detect list intent", "convert spoken lists to bullets", False),
     ("profanity", "Censor profanity", "f*** it", False),
+]
+
+# Presets are separate saved profiles: toggles, extra instructions and
+# template each. "raw" skips the model entirely.
+PRESETS = [
+    ("default", "Default"),
+    ("email", "Email"),
+    ("chat", "Chat"),
+    ("doc", "Documents"),
+    ("code", "Code"),
+    ("raw", "Raw - no AI"),
 ]
 
 _RAW_PREVIEW = (
@@ -43,6 +55,42 @@ _CLEAN_PREVIEW = (
 def _build_preview_prompt(behaviors: dict, template: str = "") -> str:
     rules = dict(behaviors)
     return CleanupEngine.build_system_prompt(rules, template=template)
+
+
+class _PreviewWorker(QThread):
+    """Runs the real cleanup engine on the sample text so the preview is
+    actually live rather than a canned string."""
+    finished_with = Signal(bool, str, int)  # ok, text, latency_ms
+
+    def __init__(self, behaviors: dict, template: str, parent=None):
+        super().__init__(parent)
+        self._behaviors = dict(behaviors)
+        self._template = template
+
+    def run(self):
+        try:
+            from whisprnick.config import OLLAMA_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT_SECONDS
+            engine = CleanupEngine(OLLAMA_URL, OLLAMA_MODEL, timeout=OLLAMA_TIMEOUT_SECONDS)
+            if not engine.is_available():
+                self.finished_with.emit(False, "", 0)
+                return
+            text, ms = engine.clean(_RAW_PREVIEW, self._behaviors, template=self._template)
+            self.finished_with.emit(True, text, ms)
+        except Exception:
+            self.finished_with.emit(False, "", 0)
+
+
+class _PresetPill(QPushButton):
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(
+            f"_PresetPill {{ padding: 7px 14px; border: 1px solid {Colors.RULE}; border-radius: 999px; "
+            f"background: {Colors.PAPER_3}; color: {Colors.INK_2}; font-size: 12.5px; font-family: \"{Fonts.BODY}\"; }}"
+            f"_PresetPill:hover {{ background: {Colors.PAPER_2}; }}"
+            f"_PresetPill:checked {{ background: {Colors.INK}; color: {Colors.PAPER}; border-color: {Colors.INK}; }}"
+        )
 
 
 class _BehaviorRow(QWidget):
@@ -91,11 +139,21 @@ class _BehaviorRow(QWidget):
 
 class CleanupPage(QWidget):
     profile_changed = Signal(dict)
+    preset_selected = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_preset = "default"
         self._behavior_rows: dict[str, _BehaviorRow] = {}
+
+        # Debounce so typing in the template box doesn't fire a request per key.
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(700)
+        self._preview_timer.timeout.connect(self._run_preview)
+        self._preview_worker: _PreviewWorker | None = None
+        self._preview_dirty = True
+        self._loading = False
 
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
@@ -114,6 +172,30 @@ class CleanupPage(QWidget):
             "Toggles below get baked into the prompt sent to the local cleanup model. Preview live on the right.",
         )
         main_layout.addWidget(header)
+
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(6)
+        preset_row.addWidget(FieldLabel("Preset"))
+        preset_row.addSpacing(6)
+        self._preset_pills: dict[str, _PresetPill] = {}
+        for key, label in PRESETS:
+            pill = _PresetPill(label)
+            pill.setChecked(key == "default")
+            pill.clicked.connect(lambda checked=False, k=key: self._on_preset_clicked(k))
+            self._preset_pills[key] = pill
+            preset_row.addWidget(pill)
+        preset_row.addStretch()
+        main_layout.addLayout(preset_row)
+
+        self._raw_note = QLabel(
+            "Raw mode: Whisper's transcript with pure fillers stripped and tidied. No AI rewrite, fastest, "
+            "and nothing can be misread as an instruction.", self)
+        self._raw_note.setWordWrap(True)
+        self._raw_note.setStyleSheet(
+            f"font-size: 12.5px; color: {Colors.INK_2}; background: {Colors.PAPER_3}; "
+            f"border: 1px solid {Colors.RULE}; border-radius: 9px; padding: 10px 12px; margin-top: 12px;")
+        self._raw_note.hide()
+        main_layout.addWidget(self._raw_note)
 
         columns = QHBoxLayout()
         columns.setSpacing(18)
@@ -141,6 +223,19 @@ class CleanupPage(QWidget):
 
         left.addSpacing(22)
 
+        left.addWidget(FieldLabel("Extra instructions"))
+        left.addSpacing(8)
+        self._suffix_edit = QTextEdit()
+        self._suffix_edit.setPlaceholderText("e.g. Keep my technical jargon. Never use em dashes. Don't expand acronyms.")
+        self._suffix_edit.setFixedHeight(72)
+        self._suffix_edit.setStyleSheet(
+            f"QTextEdit {{ font-size: 13px; border: 1px solid {Colors.RULE}; border-radius: 10px; "
+            f"background: {Colors.PAPER_3}; color: {Colors.INK}; padding: 10px; }}"
+        )
+        self._suffix_edit.textChanged.connect(self._emit_profile)
+        left.addWidget(self._suffix_edit)
+        left.addSpacing(22)
+
         tmpl_header = QHBoxLayout()
         tmpl_label = FieldLabel("Prompt template")
         tmpl_header.addWidget(tmpl_label)
@@ -165,6 +260,8 @@ class CleanupPage(QWidget):
         left.addWidget(self._template_edit)
 
         hint = QLabel("Placeholders:  {{RULES}}   {{VOCABULARY}}   {{REPLACEMENTS}}", self)
+        hint.setWordWrap(True)
+        hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         hint.setStyleSheet(
             f"font-family: \"{Fonts.MONO}\"; font-size: 11px; color: {Colors.MUTE}; "
             f"background: transparent; padding-top: 4px;"
@@ -175,6 +272,7 @@ class CleanupPage(QWidget):
         left_widget = QWidget()
         left_widget.setStyleSheet("background: transparent;")
         left_widget.setLayout(left)
+        self._left_widget = left_widget
 
         right = QVBoxLayout()
         right.setSpacing(14)
@@ -231,11 +329,11 @@ class CleanupPage(QWidget):
         clean_lay = QVBoxLayout(clean_section)
         clean_lay.setContentsMargins(16, 16, 16, 16)
         clean_lay.setSpacing(6)
-        clean_tag = QLabel("CLEANED", self)
-        clean_tag.setStyleSheet(
+        self._clean_tag = QLabel("CLEANED", self)
+        self._clean_tag.setStyleSheet(
             f"font-family: \"{Fonts.MONO}\"; font-size: 11px; color: {Colors.ACCENT_2}; background: transparent;"
         )
-        clean_lay.addWidget(clean_tag)
+        clean_lay.addWidget(self._clean_tag)
         self._clean_text = QLabel(_CLEAN_PREVIEW, self)
         self._clean_text.setWordWrap(True)
         self._clean_text.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -296,27 +394,93 @@ class CleanupPage(QWidget):
     def _on_reset_template(self):
         self._template_edit.setPlainText(DEFAULT_TEMPLATE)
 
+    def _rules_for(self, profile: dict) -> dict:
+        rules = dict(profile["behaviors"])
+        rules["prompt_suffix"] = profile["suffix"]
+        return rules
+
     def _emit_profile(self):
+        if self._loading:
+            return
         profile = self.get_profile()
         self.profile_changed.emit(profile)
-        compiled = _build_preview_prompt(profile["behaviors"], template=profile["template"])
-        self._prompt_label.setText(compiled)
+        self._prompt_label.setText(_build_preview_prompt(self._rules_for(profile), template=profile["template"]))
+        self._preview_dirty = True
+        if self.isVisible():
+            self._preview_timer.start()
+
+    # -- Presets --------------------------------------------------------
+
+    def _on_preset_clicked(self, key: str):
+        if key == self._current_preset:
+            self._preset_pills[key].setChecked(True)
+            return
+        self.preset_selected.emit(key)
+
+    def _apply_raw_mode(self, raw: bool):
+        self._left_widget.setEnabled(not raw)
+        self._raw_note.setVisible(raw)
+
+    # ── Live preview ───────────────────────────────────────────────────
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._preview_dirty:
+            self._preview_timer.start()
+
+    def _run_preview(self):
+        if self._preview_worker is not None and self._preview_worker.isRunning():
+            self._preview_timer.start()  # try again once the current one finishes
+            return
+        profile = self.get_profile()
+        self._preview_dirty = False
+        if self._current_preset == "raw":
+            self._clean_text.setText(light_clean(_RAW_PREVIEW))
+            self._clean_tag.setText("RAW · no model")
+            return
+        self._clean_tag.setText("CLEANING…")
+        self._preview_worker = _PreviewWorker(self._rules_for(profile), profile["template"], self)
+        self._preview_worker.finished_with.connect(self._on_preview_done)
+        self._preview_worker.finished.connect(self._preview_worker.deleteLater)
+        self._preview_worker.start()
+
+    def _on_preview_done(self, ok: bool, text: str, ms: int):
+        if ok and text:
+            self._clean_text.setText(text)
+            self._clean_tag.setText(f"CLEANED · {ms} ms")
+        else:
+            self._clean_text.setText(_CLEAN_PREVIEW)
+            self._clean_tag.setText("SAMPLE · Ollama offline")
 
     def set_profile(self, profile):
-        for key, row in self._behavior_rows.items():
-            val = getattr(profile, key, None)
-            if val is not None:
-                row.is_on = val
-        template = getattr(profile, "prompt_template", "") or ""
-        if template:
-            self._template_edit.setPlainText(template)
-        else:
-            self._template_edit.setPlainText(DEFAULT_TEMPLATE)
+        """Load a saved profile into the editor without re-saving it."""
+        self._loading = True
+        try:
+            preset = getattr(profile, "preset", "default") or "default"
+            self._current_preset = preset
+            for key, pill in self._preset_pills.items():
+                pill.setChecked(key == preset)
+            for key, row in self._behavior_rows.items():
+                val = getattr(profile, key, None)
+                if val is not None:
+                    row.is_on = val
+            self._suffix_edit.setPlainText(getattr(profile, "prompt_suffix", "") or "")
+            template = getattr(profile, "prompt_template", "") or ""
+            self._template_edit.setPlainText(template if template else DEFAULT_TEMPLATE)
+            self._apply_raw_mode(preset == "raw")
+        finally:
+            self._loading = False
+        p = self.get_profile()
+        self._prompt_label.setText(_build_preview_prompt(self._rules_for(p), template=p["template"]))
+        self._preview_dirty = True
+        if self.isVisible():
+            self._preview_timer.start()
 
     def get_profile(self) -> dict:
         behaviors = {key: row.is_on for key, row in self._behavior_rows.items()}
         return {
             "preset": self._current_preset,
             "behaviors": behaviors,
+            "suffix": self._suffix_edit.toPlainText().strip(),
             "template": self._template_edit.toPlainText(),
         }

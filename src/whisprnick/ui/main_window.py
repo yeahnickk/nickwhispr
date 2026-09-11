@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal, QPoint, QSize
-from PySide6.QtGui import QColor, QFont, QPainter, QCursor, QMouseEvent, QCloseEvent
+from PySide6.QtCore import Qt, Signal, QSize
+from PySide6.QtGui import QColor, QPainter, QCursor, QCloseEvent
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -11,8 +11,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QStackedWidget,
     QFrame,
-    QSizePolicy,
-    QGraphicsDropShadowEffect,
 )
 
 from whisprnick.ui.styles.theme import Colors, Fonts, get_stylesheet
@@ -23,7 +21,6 @@ from whisprnick.config import (
     WINDOW_WIDTH,
     WINDOW_HEIGHT,
     SIDEBAR_WIDTH,
-    TITLEBAR_HEIGHT,
 )
 from whisprnick.ui.pages.home import HomePage
 from whisprnick.ui.pages.history import HistoryPage
@@ -46,122 +43,6 @@ NAV_ITEMS = [
     ("Safeguards", "shield"),
     ("Settings", "settings"),
 ]
-
-
-class _TitleBarButton(QPushButton):
-    def __init__(self, symbol: str, is_close: bool = False, parent=None):
-        super().__init__(symbol, parent)
-        self._is_close = is_close
-        self.setFixedSize(46, TITLEBAR_HEIGHT)
-        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.setFont(QFont(Fonts.BODY, 10))
-        self._apply_style(False)
-
-    def _apply_style(self, hovered: bool):
-        if self._is_close:
-            if hovered:
-                bg = "#c0413a"
-                fg = "#ffffff"
-            else:
-                bg = "transparent"
-                fg = Colors.INK_2
-        else:
-            if hovered:
-                bg = "rgba(40,30,15,0.06)"
-                fg = Colors.INK
-            else:
-                bg = "transparent"
-                fg = Colors.INK_2
-        self.setStyleSheet(
-            f"QPushButton {{ background: {bg}; color: {fg}; border: none; "
-            f"font-size: 11px; }}"
-        )
-
-    def enterEvent(self, event):
-        self._apply_style(True)
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._apply_style(False)
-        super().leaveEvent(event)
-
-
-class _TitleBar(QWidget):
-    minimize_clicked = Signal()
-    maximize_clicked = Signal()
-    close_clicked = Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(TITLEBAR_HEIGHT)
-        self.setStyleSheet(
-            f"background: rgba(247,241,228,0.8); "
-            f"border-bottom: 1px solid {Colors.RULE};"
-        )
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 0, 0, 0)
-        layout.setSpacing(0)
-
-        brand_mark = QLabel("N")
-        brand_mark.setFixedSize(14, 14)
-        brand_mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        brand_mark.setStyleSheet(
-            f"background: {Colors.INK}; color: {Colors.PAPER}; "
-            f"border-radius: 3px; font-family: \"{Fonts.BODY}\"; "
-            f"font-size: 9px; font-weight: 700;"
-        )
-        layout.addWidget(brand_mark)
-        layout.addSpacing(7)
-
-        app_label = QLabel(APP_NAME)
-        app_label.setStyleSheet(
-            f"background: transparent; color: {Colors.INK}; "
-            f"font-family: \"{Fonts.BODY}\"; font-size: 12px; font-weight: 600;"
-        )
-        layout.addWidget(app_label)
-        layout.addSpacing(5)
-
-        subtitle = QLabel(f"— {APP_SUBTITLE}")
-        subtitle.setStyleSheet(
-            f"background: transparent; color: {Colors.MUTE}; "
-            f"font-family: \"{Fonts.BODY}\"; font-size: 12px;"
-        )
-        layout.addWidget(subtitle)
-
-        layout.addStretch()
-
-        self._btn_min = _TitleBarButton("–")
-        self._btn_max = _TitleBarButton("□")
-        self._btn_close = _TitleBarButton("✕", is_close=True)
-
-        self._btn_min.clicked.connect(self.minimize_clicked.emit)
-        self._btn_max.clicked.connect(self.maximize_clicked.emit)
-        self._btn_close.clicked.connect(self.close_clicked.emit)
-
-        layout.addWidget(self._btn_min)
-        layout.addWidget(self._btn_max)
-        layout.addWidget(self._btn_close)
-
-        self._drag_pos: QPoint | None = None
-
-    def mousePressEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = event.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
-            event.accept()
-
-    def mouseMoveEvent(self, event: QMouseEvent):
-        if self._drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            self.window().move(event.globalPosition().toPoint() - self._drag_pos)
-            event.accept()
-
-    def mouseReleaseEvent(self, event: QMouseEvent):
-        self._drag_pos = None
-        super().mouseReleaseEvent(event)
-
-    def mouseDoubleClickEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.maximize_clicked.emit()
 
 
 class _NavButton(QPushButton):
@@ -323,6 +204,7 @@ class _Sidebar(QWidget):
 
 class MainWindow(QMainWindow):
     page_changed = Signal(str)
+    hidden_to_tray = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -337,8 +219,6 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(central)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-
-        # No custom titlebar — using native window frame for resize/snap support
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
@@ -412,9 +292,11 @@ class MainWindow(QMainWindow):
         self._sidebar.update_ollama_status(model, ready)
 
     def closeEvent(self, event: QCloseEvent):
-        from PySide6.QtWidgets import QApplication
-        event.accept()
-        QApplication.quit()
+        # Closing the window keeps the hotkey and tray alive; Quit lives in
+        # the tray menu.
+        event.ignore()
+        self.hide()
+        self.hidden_to_tray.emit()
 
     def set_loading_status(self, text: str):
         if hasattr(self, '_loading_overlay') and self._loading_overlay.isVisible():

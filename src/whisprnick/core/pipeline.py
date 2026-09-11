@@ -3,22 +3,26 @@ import re
 import time
 from dataclasses import asdict
 from datetime import datetime
+from typing import Optional
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QMetaObject, QObject, Qt, QThread, Signal, Slot
 
 from whisprnick import config
 from whisprnick.core.active_window import get_foreground_window_info
-from whisprnick.core.audio import AudioRecorder
+from whisprnick.core.audio import AudioDeviceError, AudioRecorder, device_display_name
 from whisprnick.core.cleanup import CleanupEngine
-from whisprnick.core.injector import inject_text
-from whisprnick.core.transcribe import WhisperClient
+from whisprnick.core.context import detect_app_context
+from whisprnick.core.textutil import (
+    apply_backtrack, apply_replacements, apply_spoken_commands, light_clean, tidy_text,
+)
+from whisprnick.core.transcribe import TranscriptionError, WhisperClient, build_vocab_prompt
 from whisprnick.data.database import Database
 from whisprnick.data.models import DictationEntry
 
 log = logging.getLogger(__name__)
 
 FILLER_PATTERN = re.compile(
-    r"\b(um|uh|erm|like|you know|so|basically|actually|literally|right)\b",
+    r"\b(um+|uh+|erm|hmm+|you know|i mean|kind of|sort of|basically|literally)\b",
     re.IGNORECASE,
 )
 
@@ -49,6 +53,7 @@ class _TranscribeWorker(QObject):
         cleanup_preset: str,
         source_app: str,
         target_hwnd: int,
+        window_title: str = "",
     ):
         super().__init__()
         self._audio_bytes = audio_bytes
@@ -59,70 +64,72 @@ class _TranscribeWorker(QObject):
         self._cleanup_preset = cleanup_preset
         self._source_app = source_app
         self._target_hwnd = target_hwnd
+        self._window_title = window_title
 
     def run(self):
+        db = None
         try:
+            # Own connection: sqlite3 connections are not shared across threads.
             db = Database(self._db_path)
-            words = db.get_words()
-            word_list = [w.word for w in words]
-            prompt = ", ".join(word_list) if word_list else ""
+            word_list = [w.word for w in db.get_words()]
+            prompt = build_vocab_prompt(word_list)
 
-            raw_text = self._whisper.transcribe(
-                self._audio_bytes,
-                prompt=prompt,
-            )
-
-            if not raw_text:
-                self.error.emit("Whisper returned empty transcription")
+            try:
+                raw_text = self._whisper.transcribe(self._audio_bytes, prompt=prompt)
+            except TranscriptionError as e:
+                log.error("Transcription failed: %s", e)
+                self.error.emit("Transcription failed. See the log")
                 return
+            if not raw_text:
+                self.error.emit("Nothing heard. Try again")
+                return
+
+            replacements = {r.trigger: r.replacement for r in db.get_replacements()}
+            nicknames = {n.spoken: n.full_name for n in db.get_nicknames()}
+
+            # Resolve spoken layout commands before the model sees the text so
+            # it works with real breaks instead of the words "new line".
+            raw_text = apply_spoken_commands(raw_text)
 
             cleaned_text = raw_text
             latency_ms = 0
 
-            if self._cleanup_level != "none":
+            if self._cleanup_level != "none" and self._cleanup_preset != "raw":
                 profile = db.get_cleanup_profile(self._cleanup_preset)
                 rules = asdict(profile)
                 template = rules.pop("prompt_template", "")
-
-                dict_words = word_list if word_list else None
-                replacements_list = db.get_replacements()
-                repl_dict = (
-                    {r.trigger: r.replacement for r in replacements_list}
-                    if replacements_list
-                    else None
-                )
+                context = detect_app_context(self._source_app, self._window_title)
 
                 cleaned_text, latency_ms = self._cleanup.clean(
                     raw_text,
                     rules,
-                    dictionary_words=dict_words,
-                    replacements=repl_dict,
+                    dictionary_words=word_list or None,
+                    replacements=replacements or None,
                     template=template,
+                    context=context,
+                    allowed_extra=set(nicknames.values()),
                 )
+            else:
+                cleaned_text = light_clean(raw_text)
 
-            replacements_list = db.get_replacements()
-            for r in replacements_list:
-                cleaned_text = cleaned_text.replace(r.trigger, r.replacement)
+            # Deterministic passes run after the model so they always win.
+            cleaned_text = apply_spoken_commands(cleaned_text)
+            cleaned_text = apply_backtrack(cleaned_text)
+            cleaned_text = apply_replacements(cleaned_text, replacements)
+            cleaned_text = apply_replacements(cleaned_text, nicknames)
+            cleaned_text = tidy_text(cleaned_text)
 
-            nicknames = db.get_nicknames()
-            for n in nicknames:
-                cleaned_text = re.sub(
-                    re.escape(n.spoken),
-                    n.full_name,
-                    cleaned_text,
-                    flags=re.IGNORECASE,
-                )
+            self.finished.emit(raw_text, cleaned_text, latency_ms, self._source_app)
 
-            self.finished.emit(
-                raw_text,
-                cleaned_text,
-                latency_ms,
-                self._source_app,
-            )
-
-        except Exception as e:
+        except Exception:
             log.exception("Transcribe worker failed")
-            self.error.emit(str(e))
+            self.error.emit("Dictation failed. See the log")
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
 
 
 class DictationPipeline(QObject):
@@ -145,6 +152,7 @@ class DictationPipeline(QObject):
         self._cleanup = CleanupEngine(
             base_url=config.OLLAMA_URL,
             model=config.OLLAMA_MODEL,
+            timeout=config.OLLAMA_TIMEOUT_SECONDS,
         )
         self._recorder = AudioRecorder(
             max_duration=config.MAX_RECORDING_SECONDS,
@@ -152,11 +160,13 @@ class DictationPipeline(QObject):
         )
 
         self._source_app = ""
+        self._window_title = ""
         self._target_hwnd = 0
-        self._worker: _TranscribeWorker = None
-        self._thread: QThread = None
+        self._worker: Optional[_TranscribeWorker] = None
+        self._thread: Optional[QThread] = None
         self._state = "idle"
         self._silence_cutoff = config.SILENCE_CUTOFF_SECONDS
+        self._auto_stop_reason = ""
 
         self._recorder.on_level = self._on_audio_level
         self._recorder.on_silence = self._on_silence
@@ -166,9 +176,27 @@ class DictationPipeline(QObject):
     def state(self) -> str:
         return self._state
 
+    # ── Input device ───────────────────────────────────────────────────
+
+    def set_input_device(self, index: Optional[int]):
+        """None follows the Windows default mic; an int pins a device.
+        Takes effect on the next recording."""
+        self._recorder.device = index
+        log.info("Input device set to %s", device_display_name(index))
+
+    @property
+    def input_device(self) -> Optional[int]:
+        return self._recorder.device
+
+    # ── State ──────────────────────────────────────────────────────────
+
     def _set_state(self, state: str):
         self._state = state
         self.state_changed.emit(state)
+
+    def _request_auto_stop(self, reason: str):
+        self._auto_stop_reason = reason
+        QMetaObject.invokeMethod(self, "_auto_stop", Qt.ConnectionType.QueuedConnection)
 
     def _on_audio_level(self, rms: float):
         normalized = min(rms / 10000.0, 1.0)
@@ -176,29 +204,34 @@ class DictationPipeline(QObject):
         self.elapsed_update.emit(self._recorder.elapsed_seconds)
 
     def _on_silence(self, seconds: float):
-        cutoff = getattr(self, "_silence_cutoff", config.SILENCE_CUTOFF_SECONDS)
-        if seconds >= cutoff and self._recorder.elapsed_seconds > 1.0:
-            log.info("Silence cutoff reached (%.1f s >= %s s), discarding", seconds, cutoff)
-            self._auto_stop_reason = "silence"
-            from PySide6.QtCore import QMetaObject, Qt as _Qt
-            QMetaObject.invokeMethod(self, "_auto_stop", _Qt.ConnectionType.QueuedConnection)
+        # Runs on the audio thread. Two cases:
+        #  - user has spoken, then gone quiet for the cutoff -> finish and paste
+        #  - nothing at all was heard -> give a longer grace period, then discard
+        cutoff = self._silence_cutoff
+        if self._recorder.had_speech:
+            if seconds >= cutoff:
+                self._request_auto_stop("silence")
+        else:
+            grace = max(cutoff, config.NO_SPEECH_GRACE_SECONDS)
+            if seconds >= grace:
+                self._request_auto_stop("no_speech")
 
     def _on_max_reached(self):
-        log.info("Max recording duration reached, stopping")
-        self._auto_stop_reason = "max_duration"
-        from PySide6.QtCore import QMetaObject, Qt as _Qt
-        QMetaObject.invokeMethod(self, "_auto_stop", _Qt.ConnectionType.QueuedConnection)
+        self._request_auto_stop("max_duration")
 
     @Slot()
     def _auto_stop(self):
-        reason = getattr(self, "_auto_stop_reason", "unknown")
         if self._state != "listening":
             return
-        if reason == "silence":
-            log.info("Silence auto-stop: discarding silent audio")
+        reason = self._auto_stop_reason
+        self._auto_stop_reason = ""
+        if reason == "no_speech":
+            log.info("No speech detected, discarding recording")
             self._recorder.stop()
             self._set_state("idle")
+            self.error.emit("No speech heard. Cancelled")
         else:
+            log.info("Auto-stop (%s), transcribing", reason)
             self.stop_recording()
 
     def start_recording(self):
@@ -207,6 +240,7 @@ class DictationPipeline(QObject):
 
         window_title, app_name, hwnd = get_foreground_window_info()
         self._source_app = app_name or window_title
+        self._window_title = window_title
         self._target_hwnd = hwnd
 
         self._silence_cutoff = self._db.get_setting(
@@ -217,6 +251,19 @@ class DictationPipeline(QObject):
         )
         log.info("Safeguards: max=%ss, silence=%ss", self._recorder._max_duration, self._silence_cutoff)
 
+        try:
+            self._recorder.start()
+        except AudioDeviceError as e:
+            log.error("Microphone unavailable: %s", e)
+            self.error.emit("Microphone unavailable")
+            self._set_state("idle")
+            return
+        except Exception:
+            log.exception("Failed to start recording")
+            self.error.emit("Could not start recording. See the log")
+            self._set_state("idle")
+            return
+
         self._warmup_thread = QThread()
         self._warmup_worker = _WarmupWorker(self._cleanup)
         self._warmup_worker.moveToThread(self._warmup_thread)
@@ -226,7 +273,6 @@ class DictationPipeline(QObject):
         self._warmup_thread.finished.connect(self._warmup_thread.deleteLater)
         self._warmup_thread.start()
 
-        self._recorder.start()
         self._set_state("listening")
         log.info("Recording started, target: %s (hwnd=%d)", self._source_app, hwnd)
 
@@ -235,9 +281,17 @@ class DictationPipeline(QObject):
         if self._state != "listening":
             return
 
+        had_speech = self._recorder.had_speech
         audio_bytes = self._recorder.stop()
         if not audio_bytes:
-            self.error.emit("No audio captured")
+            self.error.emit("No audio captured. Try again")
+            self._set_state("idle")
+            return
+        if not had_speech:
+            # Nothing above the noise floor the whole time: don't even ask
+            # Whisper, it would only invent something.
+            log.info("No speech energy detected, skipping transcription")
+            self.error.emit("Nothing heard. Try again")
             self._set_state("idle")
             return
 
@@ -256,6 +310,7 @@ class DictationPipeline(QObject):
             cleanup_preset=cleanup_preset,
             source_app=self._source_app,
             target_hwnd=self._target_hwnd,
+            window_title=self._window_title,
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -298,8 +353,9 @@ class DictationPipeline(QObject):
         self.transcript_ready.emit(raw_text, cleaned_text)
         self._set_state("done")
 
+        lowered = cleaned_text.lower()
         for w in self._db.get_words():
-            if w.word.lower() in cleaned_text.lower():
+            if w.word.lower() in lowered:
                 self._db.increment_heard(w.word)
 
         log.info(

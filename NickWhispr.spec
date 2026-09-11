@@ -3,6 +3,8 @@
 import os
 import sys
 
+from PyInstaller.utils.hooks import collect_data_files
+
 block_cipher = None
 ROOT = os.path.abspath('.')
 
@@ -12,6 +14,9 @@ a = Analysis(
     binaries=[],
     datas=[
         (os.path.join(ROOT, 'src', 'whisprnick', 'resources'), 'whisprnick/resources'),
+        # faster_whisper ships the Silero VAD model as a package asset; without
+        # it every transcription in the exe fails and reads as "nothing heard".
+        *collect_data_files('faster_whisper'),
     ],
     hiddenimports=[
         'whisprnick',
@@ -21,6 +26,8 @@ a = Analysis(
         'whisprnick.core.active_window',
         'whisprnick.core.audio',
         'whisprnick.core.cleanup',
+        'whisprnick.core.context',
+        'whisprnick.core.textutil',
         'whisprnick.core.hotkey',
         'whisprnick.core.injector',
         'whisprnick.core.pipeline',
@@ -41,7 +48,6 @@ a = Analysis(
         'whisprnick.ui.pages.hud_config',
         'whisprnick.ui.pages.safeguards',
         'whisprnick.ui.pages.settings',
-        'whisprnick.ui.pages.onboarding',
         'whisprnick.ui.styles',
         'whisprnick.ui.styles.theme',
         'whisprnick.ui.widgets',
@@ -57,6 +63,7 @@ a = Analysis(
         'whisprnick.ui.widgets.stat',
         'whisprnick.ui.widgets.toggle',
         'whisprnick.ui.widgets.loading_overlay',
+        'whisprnick.ui.widgets.scroll_safe',
         'sounddevice',
         'numpy',
         'faster_whisper',

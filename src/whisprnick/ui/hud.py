@@ -48,6 +48,9 @@ class FloatingHud(QWidget):
         self._seconds_left = 10
         self._app_name = ""
         self._word_count = 0
+        self._notice_text = ""
+        self._notice_kind = "error"
+        self._notice_ms = 3200
 
         self._bar_heights = [0.3] * 10
         self._bar_timer = QTimer(self)
@@ -78,6 +81,23 @@ class FloatingHud(QWidget):
 
     # ── State management ──
 
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def show_notice(self, text: str, kind: str = "error", duration_ms: int = 3200):
+        """Small self-dismissing pill for errors and one-line status notes.
+        Replaces tray balloons: same spot as the recording pill, sized to
+        the text, gone after a few seconds."""
+        self._notice_text = (text or "").strip()
+        self._notice_kind = kind
+        self._notice_ms = max(1200, int(duration_ms))
+        body = QFont(Fonts.BODY, 12)
+        fm = QFontMetrics(body)
+        text_w = fm.horizontalAdvance(self._notice_text)
+        self._notice_width = int(max(120, min(360, text_w + 14 + 14 + 14)))
+        self.set_state("notice")
+
     def set_state(self, state: str):
         prev = self._state
         self._state = state
@@ -104,9 +124,14 @@ class FloatingHud(QWidget):
             self.setFixedHeight(44)
 
         elif state == "done":
-            self.setFixedWidth(220)
+            self.setFixedWidth(320)
             self.setFixedHeight(44)
             self._dismiss_timer.start(2000)
+
+        elif state == "notice":
+            self.setFixedWidth(getattr(self, "_notice_width", 240))
+            self.setFixedHeight(36)
+            self._dismiss_timer.start(self._notice_ms)
 
         if prev == "idle" or not self.isVisible():
             self._opacity_effect.setOpacity(0.0)
@@ -184,6 +209,8 @@ class FloatingHud(QWidget):
             self._paint_processing(p)
         elif self._state == "done":
             self._paint_done(p)
+        elif self._state == "notice":
+            self._paint_notice(p)
 
         p.end()
 
@@ -260,8 +287,11 @@ class FloatingHud(QWidget):
         close_x = w - close_size - 12
         close_y = (h - close_size) / 2
         self._close_rect = QRectF(close_x - 4, close_y - 4, close_size + 8, close_size + 8)
-        x_px = icon_pixmap("x", close_size, "rgba(255,255,255,0.5)")
+        # QtSvg doesn't understand #AARRGGBB, so fade via painter opacity.
+        x_px = icon_pixmap("x", close_size, "#ffffff")
+        p.setOpacity(0.55)
         p.drawPixmap(int(close_x), int(close_y), x_px)
+        p.setOpacity(1.0)
 
     def _paint_warning(self, p: QPainter):
         w, h = self.width(), self.height()
@@ -398,21 +428,36 @@ class FloatingHud(QWidget):
         app = self._app_name or "app"
         done_text = f"Pasted into {app} · {self._word_count} words"
         fm = QFontMetrics(body)
-        avail = w - x_cursor - 10
+        avail = w - x_cursor - 14
         elided = fm.elidedText(done_text, Qt.TextElideMode.ElideRight, int(avail))
         p.drawText(int(x_cursor), int((h + fm.ascent() - fm.descent()) / 2), elided)
 
-        mono = QFont(Fonts.MONO, 9)
-        p.setFont(mono)
-        p.setPen(QColor(184, 230, 184, 100))
-        dismiss_text = "auto-dismiss 2s"
-        fm_mono = QFontMetrics(mono)
-        dt_w = fm_mono.horizontalAdvance(dismiss_text)
-        p.drawText(
-            int(w - dt_w - 12),
-            int(h - 6),
-            dismiss_text,
-        )
+    def _paint_notice(self, p: QPainter):
+        w, h = self.width(), self.height()
+        radius = h / 2
+
+        self._draw_shadow(p, w, h, radius, QColor(0, 0, 0, 80))
+
+        pill = QRectF(0, 0, w, h)
+        p.setPen(QPen(QColor(255, 255, 255, 30), 1))
+        p.setBrush(QColor("#1a1612"))
+        p.drawRoundedRect(pill, radius, radius)
+
+        dot = QColor("#e06c5b") if self._notice_kind == "error" else QColor("#8fb8e6")
+        x_cursor = 14.0
+        dot_size = 8.0
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(dot)
+        p.drawEllipse(QRectF(x_cursor, (h - dot_size) / 2, dot_size, dot_size))
+        x_cursor += dot_size + 10
+
+        body = QFont(Fonts.BODY, 12)
+        p.setFont(body)
+        p.setPen(QColor(255, 255, 255, 230))
+        fm = QFontMetrics(body)
+        avail = w - x_cursor - 14
+        elided = fm.elidedText(self._notice_text, Qt.TextElideMode.ElideRight, int(avail))
+        p.drawText(int(x_cursor), int((h + fm.ascent() - fm.descent()) / 2), elided)
 
     def _draw_shadow(self, p: QPainter, w: float, h: float, radius: float, color: QColor):
         shadow_offset = 8

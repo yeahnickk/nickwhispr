@@ -21,6 +21,8 @@ class _HistoryItem(QWidget):
         self._id = entry.get("id", 0)
         self._active = False
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        # Plain QWidget subclasses don't paint stylesheet backgrounds unless told to.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._apply_style()
 
         layout = QVBoxLayout(self)
@@ -75,6 +77,7 @@ class _HistoryItem(QWidget):
 
 class HistoryPage(QWidget):
     entry_selected = Signal(int)
+    entry_deleted = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -181,6 +184,9 @@ class HistoryPage(QWidget):
 
         self._detail_title = QLabel("", self)
         self._detail_title.setWordWrap(True)
+        # Ignored horizontally: take the width the layout gives and wrap,
+        # instead of forcing the scroll content wider than the viewport.
+        self._detail_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self._detail_title.setStyleSheet(
             f"font-family: \"{Fonts.SERIF}\"; font-size: 24px; "
             f"letter-spacing: -0.3px; color: {Colors.INK}; background: transparent;"
@@ -202,6 +208,10 @@ class HistoryPage(QWidget):
         self._copy_btn = Btn("Copy", variant="outline", size="sm", icon_name="copy")
         self._copy_btn.clicked.connect(self._on_copy)
         btn_col.addWidget(self._copy_btn)
+
+        self._delete_btn = Btn("Delete", variant="danger", size="sm", icon_name="trash")
+        self._delete_btn.clicked.connect(self._on_delete)
+        btn_col.addWidget(self._delete_btn)
 
         top_section.addLayout(btn_col)
         self._detail_layout.addLayout(top_section)
@@ -233,6 +243,7 @@ class HistoryPage(QWidget):
 
         self._model_footer = QLabel("", self)
         self._model_footer.setWordWrap(True)
+        self._model_footer.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self._model_footer.setStyleSheet(
             f"font-family: \"{Fonts.MONO}\"; font-size: 11px; color: {Colors.MUTE}; background: transparent;"
         )
@@ -264,6 +275,7 @@ class HistoryPage(QWidget):
         self._detail_title.hide()
         self._detail_when.hide()
         self._copy_btn.hide()
+        self._delete_btn.hide()
         self._model_footer.hide()
 
         self._raw_browser.setHtml(
@@ -286,6 +298,7 @@ class HistoryPage(QWidget):
         self._detail_title.show()
         self._detail_when.show()
         self._copy_btn.show()
+        self._delete_btn.show()
         self._model_footer.show()
 
     def _on_search(self, text: str):
@@ -311,6 +324,10 @@ class HistoryPage(QWidget):
             clipboard = QApplication.clipboard()
             clipboard.setText(entry.get("body", ""))
 
+    def _on_delete(self):
+        if self._selected_id is not None:
+            self.entry_deleted.emit(self._selected_id)
+
     def _clear_list(self):
         for item in self._items:
             item.deleteLater()
@@ -335,8 +352,16 @@ class HistoryPage(QWidget):
         list_widget.setLayout(self._list_layout)
 
         if not entries:
-            # Show empty-state message in left panel
-            self._empty_list_label.show()
+            # Show empty-state message in left panel. Build it fresh: the
+            # previous one was destroyed along with the old list widget.
+            self._empty_list_label = QLabel(
+                "No dictations yet.\nPress Ctrl+Shift+Space to start.", list_widget
+            )
+            self._empty_list_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._empty_list_label.setWordWrap(True)
+            self._empty_list_label.setStyleSheet(
+                f"font-size: 13px; color: {Colors.MUTE}; background: transparent; padding: 40px 20px;"
+            )
             self._list_layout.addWidget(self._empty_list_label)
             self._list_layout.addStretch()
             self._list_scroll.setWidget(list_widget)
@@ -403,9 +428,11 @@ class HistoryPage(QWidget):
         self._detail_title.setText(entry.get("title", ""))
         self._detail_when.setText(entry.get("when", ""))
 
+        import html
+        body_html = html.escape(entry.get("body", "")).replace("\n", "<br>")
         self._clean_browser.setHtml(
             f'<div style="font-family: \'{Fonts.BODY}\'; font-size: 14px; '
-            f'line-height: 1.6; color: {Colors.INK};">{entry.get("body", "")}</div>'
+            f'line-height: 1.6; color: {Colors.INK};">{body_html}</div>'
         )
 
         whisper_model = entry.get("whisper_model", "small")

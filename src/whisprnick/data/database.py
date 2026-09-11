@@ -342,6 +342,11 @@ class Database:
         if row is None:
             return CleanupProfile(preset=preset)
         data = json.loads(row["config"])
+        # Older builds persisted the built-in prompt as if it were custom,
+        # which pinned users to stale wording. Treat those as "default".
+        from whisprnick.core.cleanup import is_default_template
+        if is_default_template(data.get("prompt_template", "")):
+            data["prompt_template"] = ""
         return CleanupProfile(**data)
 
     def save_cleanup_profile(self, profile: CleanupProfile):
@@ -420,3 +425,59 @@ class Database:
         ).fetchall()
         return [(row[0], round(row[1], 2)) for row in rows]
 
+
+    # --- Insights (period-aware) ---
+
+    def get_stats(self, days: Optional[int] = None) -> dict:
+        """Aggregate numbers for the last `days` days (None = all time)."""
+        clause, params = self._days_filter(days)
+        count, words, duration, fillers, avg_latency, active_days = self.conn.execute(
+            f"""SELECT COUNT(*), COALESCE(SUM(word_count), 0), COALESCE(SUM(duration_seconds), 0),
+                       COALESCE(SUM(filler_count), 0), COALESCE(AVG(latency_ms), 0),
+                       COUNT(DISTINCT DATE(timestamp))
+                FROM dictation_history {clause}""",
+            params,
+        ).fetchone()
+        best = self.conn.execute(
+            f"""SELECT DATE(timestamp) AS d, SUM(word_count) AS w
+                FROM dictation_history {clause} GROUP BY d ORDER BY w DESC LIMIT 1""",
+            params,
+        ).fetchone()
+        hour = self.conn.execute(
+            f"""SELECT CAST(strftime('%H', timestamp) AS INTEGER) AS h, SUM(word_count) AS w
+                FROM dictation_history {clause} GROUP BY h ORDER BY w DESC LIMIT 1""",
+            params,
+        ).fetchone()
+        longest = self.conn.execute(
+            f"SELECT COALESCE(MAX(word_count), 0) FROM dictation_history {clause}", params
+        ).fetchone()[0]
+        return {
+            "dictations": count,
+            "words": words,
+            "duration_seconds": float(duration),
+            "fillers": fillers,
+            "avg_latency_ms": int(avg_latency),
+            "active_days": active_days,
+            "avg_words": (words / count) if count else 0.0,
+            "speaking_wpm": (words / (duration / 60.0)) if duration else 0.0,
+            "best_day": (best[0], best[1]) if best else None,
+            "busiest_hour": (hour[0], hour[1]) if hour else None,
+            "longest_words": longest,
+        }
+
+    def get_daily_series(self, days: int) -> list[tuple[str, int, float]]:
+        """(iso date, words, minutes) for each of the last `days` days, oldest
+        first, with zero-filled gaps so charts always have a full axis."""
+        start = (datetime.now() - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        rows = self.conn.execute(
+            """SELECT DATE(timestamp) AS d, SUM(word_count), SUM(duration_seconds) / 60.0
+               FROM dictation_history WHERE timestamp >= ? GROUP BY d""",
+            (start.isoformat(),),
+        ).fetchall()
+        by_day = {r[0]: (int(r[1] or 0), float(r[2] or 0.0)) for r in rows}
+        series = []
+        for i in range(days):
+            d = (start + timedelta(days=i)).date().isoformat()
+            w, m = by_day.get(d, (0, 0.0))
+            series.append((d, w, round(m, 2)))
+        return series

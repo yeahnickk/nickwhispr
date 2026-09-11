@@ -358,3 +358,38 @@ def get_stylesheet() -> str:
         border-radius: 10px;
     }}
     """
+
+
+# ---------------------------------------------------------------------------
+# Font resolution. The design names DM Sans / Instrument Serif / JetBrains
+# Mono, which most Windows machines don't have. Any .ttf/.otf dropped into
+# resources/fonts is registered, then each role falls back to the first
+# installed family from its preference list. Must run after QApplication
+# exists and before any widget is built.
+# ---------------------------------------------------------------------------
+
+_FONT_PREFS = {
+    "BODY": ["DM Sans", "Inter", "Segoe UI Variable Text", "Segoe UI", "Arial"],
+    "SERIF": ["Instrument Serif", "Georgia", "Cambria", "Times New Roman"],
+    "MONO": ["JetBrains Mono", "Cascadia Code", "Cascadia Mono", "Consolas", "Courier New"],
+}
+
+
+def resolve_fonts() -> dict:
+    """Register bundled fonts and pick installed fallbacks for each role."""
+    import os
+    from PySide6.QtGui import QFontDatabase
+
+    fonts_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "resources", "fonts")
+    if os.path.isdir(fonts_dir):
+        for name in os.listdir(fonts_dir):
+            if name.lower().endswith((".ttf", ".otf")):
+                QFontDatabase.addApplicationFont(os.path.join(fonts_dir, name))
+
+    installed = set(QFontDatabase.families())
+    chosen = {}
+    for role, prefs in _FONT_PREFS.items():
+        pick = next((f for f in prefs if f in installed), prefs[-1])
+        setattr(Fonts, role, pick)
+        chosen[role] = pick
+    return chosen

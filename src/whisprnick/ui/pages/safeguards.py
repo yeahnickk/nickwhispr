@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPainter, QColor
 
 from whisprnick.ui.widgets.card import Card
+from whisprnick.ui.widgets.scroll_safe import NoWheelSlider
 from whisprnick.ui.widgets.field_label import FieldLabel
 from whisprnick.ui.widgets.section_title import SectionTitle
 from whisprnick.ui.widgets.icons import icon_label
@@ -73,7 +74,7 @@ class SafeguardsPage(QWidget):
         c1_lay.addWidget(c1_desc)
         c1_lay.addSpacing(18)
 
-        self._max_len_slider = QSlider(Qt.Orientation.Horizontal)
+        self._max_len_slider = NoWheelSlider(Qt.Orientation.Horizontal)
         self._max_len_slider.setMinimum(15)
         self._max_len_slider.setMaximum(600)
         self._max_len_slider.setSingleStep(15)
@@ -120,7 +121,7 @@ class SafeguardsPage(QWidget):
         c2_lay.addWidget(c2_desc)
         c2_lay.addSpacing(18)
 
-        self._idle_slider = QSlider(Qt.Orientation.Horizontal)
+        self._idle_slider = NoWheelSlider(Qt.Orientation.Horizontal)
         self._idle_slider.setMinimum(1)
         self._idle_slider.setMaximum(15)
         self._idle_slider.setValue(3)

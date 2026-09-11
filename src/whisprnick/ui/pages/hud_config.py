@@ -17,7 +17,7 @@ from whisprnick.ui.styles.theme import Colors, Fonts
 
 _STATES = [
     ("idle", "Idle (hidden when not dictating)"),
-    ("listening", "Listening — words stream in raw"),
+    ("listening", "Listening — timer and target app"),
     ("warning", "Approaching cap (10s left)"),
     ("processing", "Polishing with Qwen"),
     ("done", "Pasted — auto-dismiss in 2s"),
@@ -130,7 +130,7 @@ class _HudPreview(QWidget):
             f.setFamily(Fonts.BODY)
             f.setPixelSize(12)
             p.setFont(f)
-            p.drawText(bar_x + 145, cy + 4, "...show the price comparison")
+            p.drawText(bar_x + 145, cy + 4, "→ Slack")
             p.setOpacity(1.0)
 
         elif self._state == "warning":
@@ -322,18 +322,17 @@ class HudConfigPage(QWidget):
         sc_title = FieldLabel("Shortcuts")
         sc_lay.addWidget(sc_title)
 
-        for label, keys in _SHORTCUTS:
-            row = QHBoxLayout()
-            row.setSpacing(4)
-            lbl = QLabel(label, self)
-            lbl.setWordWrap(True)
-            lbl.setStyleSheet(
-                f"font-size: 13.5px; color: {Colors.INK}; background: transparent;"
-            )
-            row.addWidget(lbl, 1)
-            for k in keys:
-                row.addWidget(Kbd(k))
-            sc_lay.addLayout(row)
+        self._shortcut_row = QHBoxLayout()
+        self._shortcut_row.setSpacing(4)
+        lbl = QLabel("Start / stop", self)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet(
+            f"font-size: 13.5px; color: {Colors.INK}; background: transparent;"
+        )
+        self._shortcut_row.addWidget(lbl, 1)
+        self._kbd_widgets: list[Kbd] = []
+        self.set_hotkey("+".join(_SHORTCUTS[0][1]))
+        sc_lay.addLayout(self._shortcut_row)
 
         columns.addWidget(short_card, 1)
 
@@ -344,6 +343,14 @@ class HudConfigPage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
+
+    def set_hotkey(self, combo: str):
+        for k in self._kbd_widgets:
+            self._shortcut_row.removeWidget(k)
+            k.deleteLater()
+        self._kbd_widgets = [Kbd(part) for part in combo.split("+")]
+        for k in self._kbd_widgets:
+            self._shortcut_row.addWidget(k)
 
     def _on_state_selected(self, state_id: str):
         self._current_state = state_id

@@ -25,31 +25,38 @@ class Pill(QWidget):
         parent=None,
     ):
         super().__init__(parent)
-        t = _TONES.get(tone, _TONES["default"])
+        self._icon_name = icon_name
+        self._icon_lbl: QLabel | None = None
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(6, 3, 8, 3)
         layout.setSpacing(4)
 
         if icon_name:
-            icon_lbl = QLabel(self)
-            px = icon_pixmap(icon_name, 11, t["color"])
-            icon_lbl.setPixmap(px)
-            icon_lbl.setFixedSize(11, 11)
-            icon_lbl.setStyleSheet("background: transparent;")
-            layout.addWidget(icon_lbl)
+            self._icon_lbl = QLabel(self)
+            self._icon_lbl.setFixedSize(11, 11)
+            self._icon_lbl.setStyleSheet("background: transparent;")
+            layout.addWidget(self._icon_lbl)
 
         self._text_lbl = QLabel(text, self)
+        layout.addWidget(self._text_lbl)
+
+        self.setFixedHeight(22)
+        self.set_tone(tone)
+
+    def set_tone(self, tone: str):
+        """Recolour in place so callers can reuse one pill for status changes."""
+        t = _TONES.get(tone, _TONES["default"])
+        self._tone = tone
         self._text_lbl.setStyleSheet(
             f"background: transparent; color: {t['color']}; "
             f"font-size: 11px; font-weight: 500; font-family: \"{Fonts.BODY}\";"
         )
-        layout.addWidget(self._text_lbl)
-
+        if self._icon_lbl is not None and self._icon_name:
+            self._icon_lbl.setPixmap(icon_pixmap(self._icon_name, 11, t["color"]))
         self.setStyleSheet(
             f"Pill {{ background: {t['bg']}; border-radius: 10px; }}"
         )
-        self.setFixedHeight(22)
 
     def setText(self, text: str):
         self._text_lbl.setText(text)

@@ -55,18 +55,22 @@ class SystemTray(QSystemTrayIcon):
     start_dictation = Signal()
     quit_app = Signal()
 
-    def __init__(self, icon: QIcon = None, parent=None):
+    def __init__(self, icon: QIcon = None, parent=None, hotkey: str = DEFAULT_HOTKEY):
         super().__init__(icon or _get_icon("idle"), parent)
         self._custom_icon = icon
+        self._hotkey = hotkey
         self.setToolTip(f"{APP_NAME} — {APP_SUBTITLE}")
+        self._build_menu()
+
+    def set_hotkey(self, combo: str):
+        self._hotkey = combo
         self._build_menu()
         self.activated.connect(self._on_activated)
 
     def _build_menu(self):
         menu = QMenu()
 
-        act_dictate = menu.addAction("Start Dictation")
-        act_dictate.setShortcut(DEFAULT_HOTKEY)
+        act_dictate = menu.addAction(f"Start Dictation\t{self._hotkey}")
         act_dictate.triggered.connect(self.start_dictation.emit)
 
         menu.addSeparator()

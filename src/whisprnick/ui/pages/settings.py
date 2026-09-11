@@ -5,11 +5,11 @@ import logging
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QScrollArea, QFrame, QPushButton,
+    QScrollArea, QFrame, QPushButton, QComboBox,
 )
-from PySide6.QtCore import Qt, Signal, Slot, QThread
+from PySide6.QtCore import Qt, Signal, Slot, QThread, QMetaObject, Q_ARG
 
-from PySide6.QtGui import QPainter, QColor, QLinearGradient
+from PySide6.QtGui import QPainter, QColor, QLinearGradient, QKeyEvent
 
 from whisprnick.ui.widgets.card import Card
 from whisprnick.ui.widgets.btn import Btn
@@ -17,7 +17,8 @@ from whisprnick.ui.widgets.kbd import Kbd
 from whisprnick.ui.widgets.field_label import FieldLabel
 from whisprnick.ui.widgets.section_title import SectionTitle
 from whisprnick.ui.styles.theme import Colors, Fonts
-from whisprnick.config import APP_NAME, APP_VERSION, OLLAMA_URL, OLLAMA_MODEL, WHISPER_MODEL
+from whisprnick.config import APP_NAME, APP_VERSION, OLLAMA_URL, OLLAMA_MODEL, WHISPER_MODEL, DEFAULT_HOTKEY
+from whisprnick.core.hotkey import normalize_combo, validate_combo
 
 log = logging.getLogger(__name__)
 
@@ -67,10 +68,6 @@ _NAV_ITEMS = [
     ("about", "About"),
 ]
 
-_HOTKEYS = [
-    ("Start / stop dictation", ["Ctrl", "Shift", "Space"]),
-]
-
 class _InputLevelBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -100,35 +97,53 @@ class _InputLevelBar(QWidget):
 
 
 class _AudioMonitor:
+    """Live input meter for the Settings page. Opens the same device the
+    recorder will use so what you see is what gets recorded."""
+
     def __init__(self, level_bar: _InputLevelBar, db_label):
         self._bar = level_bar
         self._db_label = db_label
         self._stream = None
+        self.device = None  # None = system default
 
     def start(self):
+        self.stop()
         try:
             import sounddevice as sd
             import numpy as np
+            from whisprnick.core.audio import system_default_input_index
             self._np = np
 
             def callback(indata, frames, time_info, status):
                 rms = float(self._np.sqrt(self._np.mean(indata ** 2)))
                 db = 20 * self._np.log10(max(rms, 1e-10))
                 normalized = max(0.0, min(1.0, (db + 60) / 60))
-                from PySide6.QtCore import QMetaObject, Qt as _Qt, Q_ARG
                 QMetaObject.invokeMethod(
                     self._bar, "set_level",
-                    _Qt.ConnectionType.QueuedConnection,
+                    Qt.ConnectionType.QueuedConnection,
                     Q_ARG(float, normalized),
                 )
+                QMetaObject.invokeMethod(
+                    self._db_label, "setText",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(str, f"{max(db, -60):.0f} dB"),
+                )
+
+            device = self.device
+            if device is None:
+                device = system_default_input_index()
 
             self._stream = sd.InputStream(
+                device=device,
                 samplerate=16000, channels=1, dtype="float32",
                 blocksize=1024, callback=callback,
             )
             self._stream.start()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Input meter unavailable: %s", exc)
+            self._stream = None
+            self._bar.set_level(0.0)
+            self._db_label.setText("no input")
 
     def stop(self):
         if self._stream:
@@ -138,6 +153,67 @@ class _AudioMonitor:
             except Exception:
                 pass
             self._stream = None
+
+
+_QT_KEY_NAMES = {
+    Qt.Key.Key_Space: "Space", Qt.Key.Key_Return: "Enter", Qt.Key.Key_Enter: "Enter", Qt.Key.Key_Tab: "Tab",
+    Qt.Key.Key_Backspace: "Backspace", Qt.Key.Key_Insert: "Insert", Qt.Key.Key_Delete: "Delete",
+    Qt.Key.Key_Home: "Home", Qt.Key.Key_End: "End", Qt.Key.Key_PageUp: "PageUp", Qt.Key.Key_PageDown: "PageDown",
+    Qt.Key.Key_Up: "Up", Qt.Key.Key_Down: "Down", Qt.Key.Key_Left: "Left", Qt.Key.Key_Right: "Right",
+    Qt.Key.Key_CapsLock: "CapsLock", Qt.Key.Key_Pause: "Pause", Qt.Key.Key_ScrollLock: "ScrollLock",
+    Qt.Key.Key_Print: "PrintScreen",
+}
+_QT_MODIFIER_KEYS = {Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta, Qt.Key.Key_AltGr}
+
+
+class _HotkeyCapture(QLineEdit):
+    """Read-only field that turns the next key chord into a combo string."""
+    captured = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setPlaceholderText("Press the new shortcut... (Esc to cancel)")
+        self.setStyleSheet(
+            f"QLineEdit {{ background: {Colors.PAPER_3}; border: 1px solid {Colors.ACCENT}; "
+            f"border-radius: 8px; padding: 7px 10px; font-size: 13px; color: {Colors.INK}; }}"
+        )
+
+    def keyPressEvent(self, event: QKeyEvent):
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
+            self.cancelled.emit()
+            return
+        mods = event.modifiers()
+        parts = []
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            parts.append("Ctrl")
+        if mods & Qt.KeyboardModifier.AltModifier:
+            parts.append("Alt")
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            parts.append("Shift")
+        if mods & Qt.KeyboardModifier.MetaModifier:
+            parts.append("Win")
+        if key in _QT_MODIFIER_KEYS:
+            self.setText("+".join(parts) + "+..." if parts else "...")
+            return
+        if key in _QT_KEY_NAMES:
+            name = _QT_KEY_NAMES[key]
+        elif Qt.Key.Key_F1 <= key <= Qt.Key.Key_F24:
+            name = f"F{key - Qt.Key.Key_F1 + 1}"
+        elif 0x30 <= key <= 0x39 or 0x41 <= key <= 0x5A:
+            name = chr(key)
+        else:
+            self.setText("That key isn't supported")
+            return
+        combo = "+".join(parts + [name])
+        self.setText(combo)
+        self.captured.emit(combo)
+
+    def keyReleaseEvent(self, event: QKeyEvent):
+        if event.key() in _QT_MODIFIER_KEYS and self.text().endswith("..."):
+            self.setText("")
 
 
 class _NavButton(QPushButton):
@@ -153,27 +229,11 @@ class _NavButton(QPushButton):
         )
 
 
-class _HotkeyRow(QWidget):
-    def __init__(self, label: str, keys: list[str], parent=None):
-        super().__init__(parent)
-        self.setStyleSheet("background: transparent;")
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 10, 0, 10)
-        layout.setSpacing(4)
-
-        lbl = QLabel(label, self)
-        lbl.setWordWrap(True)
-        lbl.setStyleSheet(
-            f"font-size: 13px; color: {Colors.INK}; background: transparent;"
-        )
-        layout.addWidget(lbl, 1)
-
-        for k in keys:
-            layout.addWidget(Kbd(k))
-
-
 class SettingsPage(QWidget):
     wpm_changed = Signal(int)
+    # Emits a PortAudio device index, or None for "follow the system default".
+    input_device_changed = Signal(object)
+    hotkey_changed = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -371,6 +431,41 @@ class SettingsPage(QWidget):
         ac_title = FieldLabel("Audio")
         ac_lay.addWidget(ac_title)
 
+        device_title = FieldLabel("Input device")
+        ac_lay.addWidget(device_title)
+
+        device_row = QHBoxLayout()
+        device_row.setSpacing(10)
+        from whisprnick.ui.widgets.scroll_safe import NoWheelComboBox
+        self._device_combo = NoWheelComboBox(self)
+        self._device_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._device_combo.setStyleSheet(
+            f"QComboBox {{ font-size: 13px; color: {Colors.INK}; background: {Colors.PAPER_3}; "
+            f"border: 1px solid {Colors.RULE}; border-radius: 8px; padding: 6px 10px; }}"
+            f"QComboBox QAbstractItemView {{ background: {Colors.PAPER}; color: {Colors.INK}; "
+            f"selection-background-color: {Colors.PAPER_3}; }}"
+        )
+        device_row.addWidget(self._device_combo, 1)
+        self._device_refresh_btn = Btn("Refresh", variant="soft", size="sm")
+        self._device_refresh_btn.setToolTip("Re-scan for microphones plugged in since launch")
+        device_row.addWidget(self._device_refresh_btn)
+        ac_lay.addLayout(device_row)
+
+        device_note = QLabel(
+            "Starts on the system default every launch. Pick a specific mic here "
+            "to override it for this session.",
+            self,
+        )
+        device_note.setWordWrap(True)
+        device_note.setStyleSheet(
+            f"font-size: 11.5px; color: {Colors.MUTE}; background: transparent;"
+        )
+        ac_lay.addWidget(device_note)
+
+        self._populate_devices()
+        self._device_combo.currentIndexChanged.connect(self._on_device_changed)
+        self._device_refresh_btn.clicked.connect(self._on_refresh_devices)
+
         level_title = FieldLabel("Input level")
         ac_lay.addWidget(level_title)
 
@@ -381,7 +476,7 @@ class SettingsPage(QWidget):
         level_row.addWidget(mic_icon)
         self._level_bar = _InputLevelBar()
         level_row.addWidget(self._level_bar, 1)
-        self._db_label = QLabel("-12 dB", self)
+        self._db_label = QLabel("— dB", self)
         self._db_label.setStyleSheet(
             f"font-family: \"{Fonts.MONO}\"; font-size: 11px; color: {Colors.MUTE}; background: transparent;"
         )
@@ -400,14 +495,35 @@ class SettingsPage(QWidget):
         hk_lay.addWidget(hk_title)
         hk_lay.addSpacing(10)
 
-        for i, (label, keys) in enumerate(_HOTKEYS):
-            hk_lay.addWidget(_HotkeyRow(label, keys))
-            if i < len(_HOTKEYS) - 1:
-                sep = QFrame()
-                sep.setFixedHeight(1)
-                sep.setStyleSheet(f"background: {Colors.RULE_2};")
-                hk_lay.addWidget(sep)
+        hk_row = QHBoxLayout()
+        hk_row.setContentsMargins(0, 6, 0, 6)
+        hk_row.setSpacing(4)
+        hk_label = QLabel("Start / stop dictation", self)
+        hk_label.setStyleSheet(f"font-size: 13px; color: {Colors.INK}; background: transparent;")
+        hk_row.addWidget(hk_label, 1)
+        self._hotkey_kbd_layout = QHBoxLayout()
+        self._hotkey_kbd_layout.setSpacing(4)
+        self._hotkey_kbds: list[Kbd] = []
+        hk_row.addLayout(self._hotkey_kbd_layout)
+        hk_row.addSpacing(10)
+        self._hotkey_change_btn = Btn("Change", variant="soft", size="sm")
+        self._hotkey_change_btn.clicked.connect(self._begin_hotkey_capture)
+        hk_row.addWidget(self._hotkey_change_btn)
+        hk_lay.addLayout(hk_row)
 
+        self._hotkey_capture = _HotkeyCapture(self)
+        self._hotkey_capture.captured.connect(self._on_hotkey_captured)
+        self._hotkey_capture.cancelled.connect(self._end_hotkey_capture)
+        self._hotkey_capture.hide()
+        hk_lay.addWidget(self._hotkey_capture)
+
+        self._hotkey_note = QLabel(self)
+        self._hotkey_note.setWordWrap(True)
+        self._set_hotkey_note("Works anywhere on the desktop. Needs at least one modifier key.")
+        hk_lay.addWidget(self._hotkey_note)
+
+        self._hotkey = DEFAULT_HOTKEY
+        self._render_hotkey()
         self._content_layout.addWidget(hotkey_card)
 
         # --- Privacy ---
@@ -471,6 +587,51 @@ class SettingsPage(QWidget):
         self._scroll.setWidget(content)
         outer.addWidget(self._scroll, 1)
 
+    # -- Hotkey ---------------------------------------------------------
+
+    def _set_hotkey_note(self, text: str, error: bool = False):
+        color = Colors.BAD if error else Colors.MUTE
+        self._hotkey_note.setText(text)
+        self._hotkey_note.setStyleSheet(
+            f"font-size: 11.5px; color: {color}; background: transparent; padding-top: 6px;"
+        )
+
+    def _render_hotkey(self):
+        for k in self._hotkey_kbds:
+            self._hotkey_kbd_layout.removeWidget(k)
+            k.deleteLater()
+        self._hotkey_kbds = [Kbd(part) for part in self._hotkey.split("+")]
+        for k in self._hotkey_kbds:
+            self._hotkey_kbd_layout.addWidget(k)
+
+    def set_hotkey(self, combo: str):
+        self._hotkey = normalize_combo(combo)
+        self._render_hotkey()
+        self._end_hotkey_capture()
+
+    def show_hotkey_error(self, message: str):
+        self._set_hotkey_note(message, error=True)
+
+    def _begin_hotkey_capture(self):
+        self._hotkey_capture.setText("")
+        self._hotkey_capture.show()
+        self._hotkey_capture.setFocus()
+        self._hotkey_change_btn.setEnabled(False)
+        self._set_hotkey_note("Hold the modifiers, then press the key.")
+
+    def _end_hotkey_capture(self):
+        self._hotkey_capture.hide()
+        self._hotkey_change_btn.setEnabled(True)
+
+    def _on_hotkey_captured(self, combo: str):
+        err = validate_combo(combo)
+        if err:
+            self.show_hotkey_error(err)
+            self._hotkey_capture.setText("")
+            return
+        self._set_hotkey_note("Works anywhere on the desktop. Needs at least one modifier key.")
+        self.hotkey_changed.emit(normalize_combo(combo))
+
     def _scroll_to(self, section_id: str):
         widget = self._section_widgets.get(section_id)
         if widget:
@@ -482,9 +643,7 @@ class SettingsPage(QWidget):
             f"background: {color}; border-radius: 4px; border: none;"
         )
         if ready:
-            self._status_label.setText(
-                f"{model} running locally · {vram} VRAM · last response {latency}"
-            )
+            self._status_label.setText(f"{model} running locally · {vram} on disk")
         else:
             self._status_label.setText(f"{model} not running")
 
@@ -536,9 +695,57 @@ class SettingsPage(QWidget):
     def set_wpm(self, wpm: int):
         self._wpm_input.setText(str(wpm))
 
+    # ── Input device ───────────────────────────────────────────────────
+
+    def _populate_devices(self, keep_index=None):
+        """Fill the combo. ``keep_index`` re-selects a device after a refresh."""
+        from whisprnick.core.audio import list_input_devices
+
+        self._device_combo.blockSignals(True)
+        self._device_combo.clear()
+        self._device_combo.addItem("System default", None)
+        selected_row = 0
+        for row, dev in enumerate(list_input_devices(), start=1):
+            self._device_combo.addItem(dev["name"], dev["index"])
+            if keep_index is not None and dev["index"] == keep_index:
+                selected_row = row
+        self._device_combo.setCurrentIndex(selected_row)
+        self._device_combo.blockSignals(False)
+
+    def current_input_device(self):
+        return self._device_combo.currentData()
+
+    @Slot(int)
+    def _on_device_changed(self, _row: int):
+        device = self.current_input_device()
+        log.info("Input device selected: %s", self._device_combo.currentText())
+        self.input_device_changed.emit(device)
+        if hasattr(self, "_audio_monitor"):
+            self._audio_monitor.device = device
+            if self.isVisible():
+                self._audio_monitor.start()
+
+    @Slot()
+    def _on_refresh_devices(self):
+        from whisprnick.core.audio import refresh_devices
+
+        previous_name = self._device_combo.currentText()
+        if hasattr(self, "_audio_monitor"):
+            self._audio_monitor.stop()
+        refresh_devices()  # indices can change, so match by name afterwards
+        self._populate_devices()
+        row = self._device_combo.findText(previous_name)
+        if row < 0:
+            row = 0
+        self._device_combo.blockSignals(True)
+        self._device_combo.setCurrentIndex(row)
+        self._device_combo.blockSignals(False)
+        self._on_device_changed(row)
+
     def _ensure_audio_monitor(self):
         if not hasattr(self, "_audio_monitor"):
             self._audio_monitor = _AudioMonitor(self._level_bar, self._db_label)
+            self._audio_monitor.device = self.current_input_device()
 
     def showEvent(self, event):
         super().showEvent(event)

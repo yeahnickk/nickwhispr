@@ -14,35 +14,6 @@ from whisprnick.ui.widgets.icons import icon_pixmap, icon_label
 from whisprnick.ui.styles.theme import Colors, Fonts
 
 
-class _ConfidenceBar(QWidget):
-    def __init__(self, value: int = 0, parent=None):
-        super().__init__(parent)
-        self._value = value
-        self.setFixedSize(64, 4)
-
-    def set_value(self, v: int):
-        self._value = v
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(Colors.RULE_2))
-        p.drawRoundedRect(0, 0, self.width(), self.height(), 2, 2)
-        if self._value > 0:
-            if self._value > 90:
-                color = Colors.GOOD
-            elif self._value > 80:
-                color = Colors.ACCENT
-            else:
-                color = Colors.WARN
-            w = int(self.width() * self._value / 100)
-            p.setBrush(QColor(color))
-            p.drawRoundedRect(0, 0, w, self.height(), 2, 2)
-        p.end()
-
-
 class _TabButton(QPushButton):
     def __init__(self, text: str, active: bool = False, parent=None):
         super().__init__(text, parent)
@@ -72,7 +43,7 @@ class _TabButton(QPushButton):
 class _VocabRow(QWidget):
     delete_clicked = Signal()
 
-    def __init__(self, word: str, pronunciation: str, heard: int, confidence: int, parent=None):
+    def __init__(self, word: str, pronunciation: str, heard: int, parent=None):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         layout = QHBoxLayout(self)
@@ -100,21 +71,6 @@ class _VocabRow(QWidget):
         heard_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         heard_lbl.setFixedWidth(40)
         layout.addWidget(heard_lbl)
-
-        conf_box = QWidget(self)
-        conf_box.setStyleSheet("background: transparent;")
-        conf_layout = QHBoxLayout(conf_box)
-        conf_layout.setContentsMargins(0, 0, 0, 0)
-        conf_layout.setSpacing(8)
-        bar = _ConfidenceBar(confidence, self)
-        conf_layout.addWidget(bar)
-        pct_lbl = QLabel(f"{confidence}%", self)
-        pct_lbl.setStyleSheet(
-            f"font-family: \"{Fonts.MONO}\"; font-size: 11px; color: {Colors.MUTE}; background: transparent;"
-        )
-        pct_lbl.setFixedWidth(28)
-        conf_layout.addWidget(pct_lbl)
-        layout.addWidget(conf_box)
 
         del_btn = Btn(icon_name="trash", variant="ghost", size="sm", parent=self)
         del_btn.setToolTip("Delete")
@@ -279,8 +235,11 @@ class DictionaryPage(QWidget):
     def _clear_content(self):
         while self._content_area.count():
             item = self._content_area.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            w = item.widget()
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
 
     def _rebuild_content(self):
         self._clear_content()
@@ -309,7 +268,7 @@ class DictionaryPage(QWidget):
                 f"font-size: 11px; color: {Colors.MUTE}; letter-spacing: 0.8px; background: transparent;"
             )
             h_layout.addWidget(lbl, stretch)
-        for text, w in [("HEARD", 40), ("CONFIDENCE", 100)]:
+        for text, w in [("HEARD", 40)]:
             lbl = QLabel(text, self)
             lbl.setStyleSheet(
                 f"font-size: 11px; color: {Colors.MUTE}; letter-spacing: 0.8px; background: transparent;"
@@ -330,7 +289,7 @@ class DictionaryPage(QWidget):
         card_layout.addWidget(sep)
 
         for i, w in enumerate(self._words):
-            row = _VocabRow(w["word"], w.get("pronunciation", ""), w.get("heard", 0), w.get("confidence", 0))
+            row = _VocabRow(w["word"], w.get("pronunciation", ""), w.get("heard", 0))
             idx = i
             row.delete_clicked.connect(lambda idx=idx: self.word_deleted.emit(idx))
             card_layout.addWidget(row)

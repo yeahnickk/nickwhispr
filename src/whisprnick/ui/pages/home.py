@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QGridLayout,
     QFrame, QScrollArea,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 
 from whisprnick.ui.widgets.card import Card
 from whisprnick.ui.widgets.btn import Btn
@@ -18,11 +18,12 @@ from whisprnick.ui.widgets.pipeline import PipelineWidget
 from whisprnick.ui.widgets.icons import icon_pixmap
 from whisprnick.ui.styles.theme import Colors, Fonts
 _TIPS = [
-    "Tip: hold Ctrl+Shift+Space to dictate anywhere.",
-    'Tip: say "new paragraph" to start a new ¶.',
-    "Tip: recording auto-stops after 60s or 3s of silence.",
+    "Tip: press your hotkey to start dictating, and again to stop.",
+    'Tip: say "new paragraph" or "new line" to break up your text.',
+    "Tip: recording stops on its own after a pause — tune it under Safeguards.",
     "Tip: Qwen runs on your machine — no internet, no bill.",
     "Tip: text gets pasted into whatever window you were in.",
+    "Tip: pick a different mic under Settings › Audio. It resets to the system default on launch.",
 ]
 
 def _greeting() -> str:
@@ -37,6 +38,7 @@ def _greeting() -> str:
 class _RecentRow(QWidget):
     def __init__(self, entry: dict, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(
             f"_RecentRow {{ background: {Colors.PAPER_2}; "
             f"border: 1px solid {Colors.RULE}; border-radius: 10px; }} "
@@ -135,13 +137,8 @@ class HomePage(QWidget):
         self._greeting_lbl.setTextFormat(Qt.TextFormat.RichText)
         self._greeting_lbl.setWordWrap(True)
         self._greeting_lbl.setStyleSheet("background: transparent;")
-        self._greeting_lbl.setText(
-            f'<span style="font-family: \'{Fonts.SERIF}\'; font-size: 36px; '
-            f'letter-spacing: -0.5px; color: {Colors.INK};">'
-            f'{_greeting()}.</span>'
-            f'<span style="font-family: \'{Fonts.SERIF}\'; font-size: 36px; '
-            f'letter-spacing: -0.5px; color: {Colors.MUTE};"> Press Ctrl+Shift+Space to dictate.</span>'
-        )
+        self._hotkey = "Ctrl+Shift+Space"
+        self._render_greeting()
         root.addWidget(self._greeting_lbl)
 
         cards_row = QHBoxLayout()
@@ -223,18 +220,56 @@ class HomePage(QWidget):
 
         root.addStretch()
         self._recording_state = "idle"
+        self._error_timer = QTimer(self)
+        self._error_timer.setSingleShot(True)
+        self._error_timer.setInterval(6000)
+        self._error_timer.timeout.connect(self._clear_error)
+
+    def _render_greeting(self):
+        self._greeting_lbl.setText(
+            f'<span style="font-family: \'{Fonts.SERIF}\'; font-size: 36px; '
+            f'letter-spacing: -0.5px; color: {Colors.INK};">'
+            f'{_greeting()}.</span>'
+            f'<span style="font-family: \'{Fonts.SERIF}\'; font-size: 36px; '
+            f'letter-spacing: -0.5px; color: {Colors.MUTE};"> Press {self._hotkey} to dictate.</span>'
+        )
+
+    def set_hotkey(self, combo: str):
+        self._hotkey = combo
+        self._render_greeting()
 
     def set_recording_state(self, state: str):
         self._recording_state = state
         if state == "listening":
-            self._ready_pill = Pill("Recording...", tone="accent")
+            self._error_timer.stop()
+            self._set_status("Recording...", "accent")
         elif state == "processing":
-            self._ready_pill = Pill("Processing...", tone="warn")
+            self._set_status("Processing...", "warn")
+        elif state == "done":
+            self._set_status("Pasted", "good")
         elif state == "idle":
-            self._ready_pill = Pill("Ready", tone="paper")
+            # An error arrives a moment before "idle"; keep it readable.
+            if not self._error_timer.isActive():
+                self._set_status("Ready", "paper")
+
+    def _set_status(self, text: str, tone: str):
+        # Update the pill that is actually in the layout; replacing the
+        # object would leave the visible one frozen on "Ready".
+        self._ready_pill.setText(text)
+        self._ready_pill.set_tone(tone)
+
+    def show_error(self, message: str):
+        short = message if len(message) <= 60 else message[:57] + "..."
+        self._set_status(short, "bad")
+        self._error_timer.start()
+
+    def _clear_error(self):
+        if self._recording_state == "idle":
+            self._set_status("Ready", "paper")
 
     def update_transcript(self, raw: str, cleaned: str):
-        pass
+        words = len(cleaned.split())
+        self._set_status(f"Pasted · {words} words", "good")
 
     def update_stats(self, words: int, duration: float, wpm: int = 40):
         pages = words / 300
@@ -251,8 +286,11 @@ class HomePage(QWidget):
     def set_recent_dictations(self, entries: list):
         while self._recent_layout.count():
             item = self._recent_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            w = item.widget()
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
 
         for entry in entries[:3]:
             row = _RecentRow(entry, self)

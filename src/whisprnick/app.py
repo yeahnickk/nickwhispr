@@ -79,9 +79,10 @@ def _check_ollama_async(callback):
     from PySide6.QtCore import QThread, Signal as _Sig
 
     class _Worker(QThread):
-        result = _Sig(str, bool)
+        result = _Sig(str, bool, str)
 
         def run(self):
+            size_str = "-"
             try:
                 import httpx
                 resp = httpx.get(f"{config.OLLAMA_URL}/api/tags", timeout=4.0)
@@ -89,6 +90,9 @@ def _check_ollama_async(callback):
                 data = resp.json()
                 models = [m.get("name", "") for m in data.get("models", [])]
                 ready = any(config.OLLAMA_MODEL in m for m in models)
+                for m in data.get("models", []):
+                    if config.OLLAMA_MODEL in m.get("name", "") and m.get("size"):
+                        size_str = f"{m['size'] / 1e9:.1f} GB"
                 if ready:
                     try:
                         httpx.post(
@@ -99,9 +103,9 @@ def _check_ollama_async(callback):
                         log.info("Model %s pre-warmed", config.OLLAMA_MODEL)
                     except Exception:
                         pass
-                self.result.emit(config.OLLAMA_MODEL, ready)
+                self.result.emit(config.OLLAMA_MODEL, ready, size_str)
             except Exception:
-                self.result.emit(config.OLLAMA_MODEL, False)
+                self.result.emit(config.OLLAMA_MODEL, False, size_str)
 
     worker = _Worker()
     worker.result.connect(callback)
@@ -153,6 +157,8 @@ class Application:
         self._app.setApplicationName(APP_NAME)
         self._app.setOrganizationName("Vozi")
         self._app.setApplicationVersion(APP_VERSION)
+        from whisprnick.ui.styles.theme import resolve_fonts
+        log.info("Fonts resolved: %s", resolve_fonts())
         self._app.setStyleSheet(get_stylesheet())
         self._app.setQuitOnLastWindowClosed(False)  # keep running in tray
 
@@ -187,9 +193,15 @@ class Application:
         self._tray = SystemTray(self._app_icon)
 
         # ── Hotkey listener + thread bridge ────────────────────────────
-        self._hotkey = HotkeyListener(key_combo=DEFAULT_HOTKEY)
+        from whisprnick.core.hotkey import normalize_combo, validate_combo
+        self._hotkey_combo = self._db.get_setting("hotkey", DEFAULT_HOTKEY)
+        if validate_combo(self._hotkey_combo):
+            self._hotkey_combo = DEFAULT_HOTKEY
+        self._hotkey_combo = normalize_combo(self._hotkey_combo)
+        self._hotkey = HotkeyListener(key_combo=self._hotkey_combo)
         self._bridge = _HotkeyBridge()
         self._hotkey.on_press = self._bridge.pressed.emit
+        self._tray.set_hotkey(self._hotkey_combo)
 
         # ── Idle-return timer (returns pipeline to idle after "done") ──
         self._idle_timer = QTimer()
@@ -201,6 +213,8 @@ class Application:
         self._ollama_worker = None
         self._whisper_worker = None
         self._whisper_ready = False
+        self._hud_state = "idle"
+        self._tray_hint_shown = False
 
         # ── Wire everything ────────────────────────────────────────────
         self._connect_hotkey()
@@ -235,9 +249,17 @@ class Application:
 
         if not self._whisper_ready:
             log.warning("Whisper model still loading, ignoring hotkey")
+            self._notify("Whisper is still loading. Try again in a moment")
             return
 
         self._pipeline.start_recording()
+
+    def _notify(self, message: str, warning: bool = True):
+        """One-line notice in the floating pill (no Windows tray balloons)."""
+        try:
+            self._hud.show_notice(message, kind="error" if warning else "info")
+        except Exception:
+            log.debug("HUD notice failed", exc_info=True)
 
     # ── Pipeline -> HUD ────────────────────────────────────────────────
 
@@ -249,8 +271,11 @@ class Application:
 
     @Slot(str)
     def _on_pipeline_state_for_hud(self, state: str):
+        self._hud_state = state
         if state == "listening":
             self._hud.set_state("listening")
+            self._hud.update_listening(0.0, self._pipeline._recorder._max_duration,
+                                       f"→ {self._pipeline._source_app or 'active window'}")
             self._hud.show_at_taskbar()
             self._idle_timer.stop()
         elif state == "processing":
@@ -262,13 +287,31 @@ class Application:
             self._hud.set_state("done")
             self._idle_timer.start()
         elif state == "idle":
-            self._hud.set_state("idle")
+            # An error notice arrives just before "idle"; let it finish.
+            if self._hud.state != "notice":
+                self._hud.set_state("idle")
             self._idle_timer.stop()
 
     @Slot(float)
     def _on_elapsed_for_hud(self, elapsed: float):
         max_dur = self._pipeline._recorder._max_duration
-        self._hud.update_listening(elapsed, max_dur, "")
+        seconds_left = int(max_dur - elapsed)
+        target = f"→ {self._pipeline._source_app or 'active window'}"
+
+        # Flip the HUD into its amber "approaching cap" look for the last
+        # 10 seconds, where the +30s button lives. Extending flips it back.
+        if self._pipeline.state == "listening":
+            if seconds_left <= 10 and self._hud_state != "warning":
+                self._hud_state = "warning"
+                self._hud.set_state("warning")
+            elif seconds_left > 10 and self._hud_state == "warning":
+                self._hud_state = "listening"
+                self._hud.set_state("listening")
+
+        if self._hud_state == "warning":
+            self._hud.update_warning(max(0, seconds_left))
+        else:
+            self._hud.update_listening(elapsed, max_dur, target)
 
     @Slot(float)
     def _on_level_for_hud(self, level: float):
@@ -283,14 +326,13 @@ class Application:
     @Slot(str)
     def _on_pipeline_error(self, message: str):
         log.error("Pipeline error: %s", message)
-        self._hud.set_state("idle")
+        self._hud.show_notice(message, kind="error")
 
     # ── Pipeline -> MainWindow ─────────────────────────────────────────
 
     def _connect_pipeline_to_window(self):
         self._pipeline.state_changed.connect(self._on_pipeline_state_for_window)
         self._pipeline.transcript_ready.connect(self._on_transcript_ready)
-        self._pipeline.elapsed_update.connect(self._on_elapsed_for_window)
         self._pipeline.error.connect(self._on_error_for_window)
 
     @Slot(str)
@@ -349,18 +391,12 @@ class Application:
                 })
             history.set_entries(entries)
 
-    @Slot(float)
-    def _on_elapsed_for_window(self, elapsed: float):
-        pass
-
     @Slot(str)
     def _on_error_for_window(self, message: str):
         log.error("Pipeline error for window: %s", message)
         home = self._get_home_page()
         if home:
-            home.set_recording_state("idle")
-            if hasattr(home, 'update_transcript'):
-                home.update_transcript("", f"Error: {message}")
+            home.show_error(message)
 
     # ── Pipeline -> Tray ───────────────────────────────────────────────
 
@@ -405,6 +441,16 @@ class Application:
         self._tray.toggle_window.connect(self._toggle_window)
         self._tray.start_dictation.connect(self._on_tray_dictation)
         self._tray.quit_app.connect(self._quit)
+        self._window.hidden_to_tray.connect(self._on_hidden_to_tray)
+
+    @Slot()
+    def _on_hidden_to_tray(self):
+        if not self._tray_hint_shown:
+            self._tray_hint_shown = True
+            self._notify(
+                f"Still running in the tray. {self._hotkey_combo} works anywhere",
+                warning=False,
+            )
 
     @Slot()
     def _toggle_window(self):
@@ -434,10 +480,21 @@ class Application:
         if settings_page is None:
             return
         settings_page.wpm_changed.connect(self._on_wpm_changed)
+        settings_page.input_device_changed.connect(self._on_input_device_changed)
+        settings_page.hotkey_changed.connect(self._on_hotkey_changed)
 
         cleanup_page = self._get_page_widget("Cleanup")
         if cleanup_page and hasattr(cleanup_page, "profile_changed"):
             cleanup_page.profile_changed.connect(self._on_cleanup_changed)
+            cleanup_page.preset_selected.connect(self._on_preset_selected)
+
+        insights = self._get_page_widget("Insights")
+        if insights and hasattr(insights, "period_changed"):
+            insights.period_changed.connect(lambda _v: self._refresh_insights())
+
+        history = self._get_page_widget("History")
+        if history and hasattr(history, "entry_deleted"):
+            history.entry_deleted.connect(self._on_history_delete)
 
         safeguards_page = self._get_page_widget("Safeguards")
         if safeguards_page and hasattr(safeguards_page, "settings_changed"):
@@ -449,6 +506,67 @@ class Application:
             return self._window._stack.widget(idx)
         return None
 
+    def _apply_hotkey_to_ui(self, combo: str):
+        for page in ("Home", "Settings", "HUD widget"):
+            w = self._get_page_widget(page)
+            if w is not None and hasattr(w, "set_hotkey"):
+                w.set_hotkey(combo)
+        self._tray.set_hotkey(combo)
+
+    @Slot(str)
+    def _on_hotkey_changed(self, combo: str):
+        """Re-register the global hotkey live; revert if Windows refuses it."""
+        from whisprnick.core.hotkey import normalize_combo
+        combo = normalize_combo(combo)
+        if combo == self._hotkey_combo:
+            self._apply_hotkey_to_ui(combo)
+            return
+        old = self._hotkey_combo
+        self._hotkey.stop()
+        candidate = HotkeyListener(key_combo=combo)
+        candidate.on_press = self._bridge.pressed.emit
+        if candidate.start():
+            self._hotkey = candidate
+            self._hotkey_combo = combo
+            self._db.set_setting("hotkey", combo)
+            self._apply_hotkey_to_ui(combo)
+            self._notify(f"Hotkey is now {combo}", warning=False)
+            log.info("Hotkey changed to %s", combo)
+            return
+        error = candidate.register_error or f"Could not register {combo}"
+        candidate.stop()
+        self._hotkey = HotkeyListener(key_combo=old)
+        self._hotkey.on_press = self._bridge.pressed.emit
+        self._hotkey.start()
+        settings_page = self._get_settings_page()
+        if settings_page:
+            settings_page.set_hotkey(old)
+            settings_page.show_hotkey_error(error)
+        self._notify(error)
+
+    @Slot(int)
+    def _on_history_delete(self, entry_id: int):
+        self._db.delete_dictation(entry_id)
+        self._refresh_history_page()
+        self._refresh_home_stats()
+        self._refresh_recent_dictations()
+        self._refresh_insights()
+
+    @Slot(str)
+    def _on_preset_selected(self, preset: str):
+        self._db.set_setting("cleanup_preset", preset)
+        cleanup_page = self._get_page_widget("Cleanup")
+        if cleanup_page is not None:
+            profile = self._db.get_cleanup_profile(preset)
+            profile.preset = preset
+            cleanup_page.set_profile(profile)
+        log.info("Cleanup preset switched to '%s'", preset)
+
+    @Slot(object)
+    def _on_input_device_changed(self, device):
+        # Session-only on purpose: every launch starts on the system default.
+        self._pipeline.set_input_device(device)
+
     @Slot(int)
     def _on_wpm_changed(self, wpm: int):
         self._db.set_setting("typing_wpm", wpm)
@@ -459,11 +577,16 @@ class Application:
     @Slot(dict)
     def _on_cleanup_changed(self, profile: dict):
         from whisprnick.data.models import CleanupProfile
+        from whisprnick.core.cleanup import is_default_template
         preset = profile.get("preset", "default")
         behaviors = profile.get("behaviors", {})
         template = profile.get("template", "")
+        if is_default_template(template):
+            # Store "" so future improvements to the built-in prompt apply.
+            template = ""
         cp = CleanupProfile(
             preset=preset,
+            prompt_suffix=profile.get("suffix", ""),
             fillers=behaviors.get("fillers", True),
             grammar=behaviors.get("grammar", True),
             punctuation=behaviors.get("punctuation", True),
@@ -666,11 +789,14 @@ class Application:
             wpm = self._db.get_setting("typing_wpm", 40)
             settings_page.set_wpm(wpm)
 
+        self._apply_hotkey_to_ui(self._hotkey_combo)
+
         # Load cleanup profile into UI
         cleanup_page = self._get_page_widget("Cleanup")
         if cleanup_page and hasattr(cleanup_page, "set_profile"):
             preset = self._db.get_setting("cleanup_preset", "default")
             profile = self._db.get_cleanup_profile(preset)
+            profile.preset = preset
             cleanup_page.set_profile(profile)
             log.info("Loaded cleanup profile: %s (suffix: %s...)", preset, profile.prompt_suffix[:30] if profile.prompt_suffix else "empty")
 
@@ -701,42 +827,20 @@ class Application:
         insights = self._get_page_widget("Insights")
         if insights is None:
             return
-        words = self._db.get_total_words(days=7)
-        duration = self._db.get_total_duration(days=7)
-        fillers = self._db.get_total_fillers(days=7)
+        days = insights.period_days
         wpm = self._db.get_setting("typing_wpm", 40)
-        time_saved = words / max(wpm, 1)
-        insights.update_stats(words, time_saved, fillers)
-
-        daily = self._db.get_daily_activity(days=7)
-        daily_map = {d: m for d, m in daily}
-        today = datetime.now().date()
-        today_weekday = today.weekday()
-        monday = today - timedelta(days=today_weekday)
-        daily_mins = [
-            daily_map.get((monday + timedelta(days=i)).isoformat(), 0.0)
-            for i in range(7)
-        ]
-        insights.update_activity(daily_mins, highlight_index=today_weekday)
-
-        app_usage = self._db.get_app_usage(days=7)
-        total_w = sum(c for _, c in app_usage) if app_usage else 1
-        app_pcts = [(n, int(c / total_w * 100)) for n, c in app_usage[:5]] if app_usage else []
-        insights.update_app_usage(app_pcts)
-
-        top_fillers = self._db.get_top_fillers(days=7, limit=6)
-        insights.update_top_fillers(top_fillers)
+        insights.update_stats(self._db.get_stats(days), wpm)
+        insights.update_activity(self._db.get_daily_series(insights.chart_days()))
+        insights.update_app_usage(self._db.get_app_usage(days=days))
+        insights.update_top_fillers(self._db.get_top_fillers(days=days, limit=8))
 
     def _check_ollama(self):
         """Probe Ollama availability and update sidebar + settings."""
-        def on_result(model: str, ready: bool):
+        def on_result(model: str, ready: bool, size_str: str):
             self._window.update_ollama_status(model, ready)
             settings_page = self._get_settings_page()
             if settings_page:
-                if ready:
-                    settings_page.set_ollama_status(model, True, "~2 GB", "ready")
-                else:
-                    settings_page.set_ollama_status(model, False, "—", "offline")
+                settings_page.set_ollama_status(model, ready, size_str, "")
 
         self._ollama_worker = _check_ollama_async(on_result)
 
@@ -749,6 +853,8 @@ class Application:
                 self._whisper_ready = bool(value)
                 self._window.dismiss_loading()
                 log.info("Whisper model preload complete (ready=%s)", value)
+                if not self._whisper_ready:
+                    self._notify("Whisper failed to load. See the log and restart")
 
         self._whisper_worker = _preload_whisper_async(on_event)
 
@@ -758,8 +864,10 @@ class Application:
 
     def run(self):
         # Start the global keyboard hook listener
-        self._hotkey.start()
-        log.info("Hotkey listener started for %s", DEFAULT_HOTKEY)
+        if not self._hotkey.start():
+            QTimer.singleShot(1500, lambda: self._notify(
+                self._hotkey.register_error or f"{self._hotkey_combo} is unavailable. Change it in Settings",
+            ))
 
         # Probe Ollama in the background (non-blocking)
         QTimer.singleShot(500, self._check_ollama)
